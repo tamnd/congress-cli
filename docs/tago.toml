@@ -1,0 +1,10 @@
+title       = "congress"
+baseURL     = "https://congress-cli.tamnd.com/"
+description = "A command line for congress."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/congress-cli"
