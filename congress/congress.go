@@ -1,62 +1,71 @@
 // Package congress is the library behind the congress command line:
-// the HTTP client, request shaping, and the typed data models for congress.
+// the HTTP client, request shaping, and typed data models for the Congress.gov API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client sets a real User-Agent, paces requests to stay polite, and retries
+// transient failures (429 and 5xx). All endpoint calls append api_key and format=json
+// automatically via the get() helper.
 package congress
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to congress. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "congress/dev (+https://github.com/tamnd/congress-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at congress.com; change it once you
-// know the real endpoints you want to read.
-const Host = "congress.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to congress over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds the client configuration.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	APIKey    string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://api.congress.gov/v3",
+		UserAgent: "congress-cli/0.1.0 (github.com/tamnd/congress-cli)",
+		APIKey:    "DEMO_KEY",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the Congress.gov API over HTTPS.
+type Client struct {
+	http *http.Client
+	cfg  Config
+
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client using cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		http: &http.Client{Timeout: cfg.Timeout},
+		cfg:  cfg,
+	}
+}
+
+// get fetches rawURL, automatically appending api_key and format=json.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
+	sep := "?"
+	if strings.Contains(rawURL, "?") {
+		sep = "&"
+	}
+	rawURL += sep + "api_key=" + c.cfg.APIKey + "&format=json"
+
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +73,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,7 +82,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
 func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
@@ -82,9 +91,10 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -104,12 +114,14 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace blocks until at least Rate has elapsed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +135,261 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on congress.com. It is a stand-in for the typed records you
-// will model from the real congress endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `congress cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// ---- Data models ----
+
+// LatestAction describes the most recent legislative action on a bill.
+type LatestAction struct {
+	ActionDate string `json:"actionDate"`
+	Text       string `json:"text"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// Bill represents a legislative bill from Congress.gov.
+type Bill struct {
+	Congress     int          `json:"congress"`
+	Type         string       `json:"type"`
+	Number       string       `json:"number"`
+	Title        string       `json:"title"`
+	LatestAction LatestAction `json:"latestAction"`
+	URL          string       `json:"url"`
+}
+
+// BillDetail holds extended bill information returned by the single-bill endpoint.
+type BillDetail struct {
+	Congress     int          `json:"congress"`
+	Type         string       `json:"type"`
+	Number       string       `json:"number"`
+	Title        string       `json:"title"`
+	LatestAction LatestAction `json:"latestAction"`
+	URL          string       `json:"url,omitempty"`
+	// Extended fields
+	Sponsors          []Sponsor `json:"sponsors,omitempty"`
+	PolicyArea        *struct {
+		Name string `json:"name"`
+	} `json:"policyArea,omitempty"`
+	Introduced        string `json:"introducedDate,omitempty"`
+	OriginChamber     string `json:"originChamber,omitempty"`
+	OriginChamberCode string `json:"originChamberCode,omitempty"`
+	UpdateDate        string `json:"updateDate,omitempty"`
+}
+
+// Sponsor is a bill sponsor reference.
+type Sponsor struct {
+	BioguideID string `json:"bioguideId"`
+	FirstName  string `json:"firstName"`
+	LastName   string `json:"lastName"`
+	Party      string `json:"party"`
+	State      string `json:"state"`
+}
+
+// Depiction holds a member's image information.
+type Depiction struct {
+	ImageURL  string `json:"imageUrl"`
+	Copyright string `json:"copyright,omitempty"`
+}
+
+// Member represents a member of Congress.
+type Member struct {
+	BioguideID string    `json:"bioguideId"`
+	Name       string    `json:"name"`
+	State      string    `json:"state"`
+	PartyName  string    `json:"partyName"`
+	District   int       `json:"district,omitempty"`
+	Depiction  Depiction `json:"depiction,omitempty"`
+	URL        string    `json:"url,omitempty"`
+}
+
+// MemberDetail holds extended member information.
+type MemberDetail struct {
+	BioguideID    string    `json:"bioguideId"`
+	FirstName     string    `json:"firstName"`
+	LastName      string    `json:"lastName"`
+	DirectOrderName string  `json:"directOrderName,omitempty"`
+	State         string    `json:"state"`
+	PartyName     string    `json:"partyName"`
+	District      int       `json:"district,omitempty"`
+	Depiction     Depiction `json:"depiction,omitempty"`
+	BirthYear     string    `json:"birthYear,omitempty"`
+	CurrentMember bool      `json:"currentMember,omitempty"`
+	Leadership    []struct {
+		Type string `json:"type"`
+	} `json:"leadership,omitempty"`
+}
+
+// Committee represents a congressional committee.
+type Committee struct {
+	SystemCode        string `json:"systemCode"`
+	Name              string `json:"name"`
+	Chamber           string `json:"chamber"`
+	CommitteeTypeCode string `json:"committeeTypeCode"`
+	URL               string `json:"url,omitempty"`
+}
+
+// Pagination holds paging metadata from list responses.
+type Pagination struct {
+	Count  int    `json:"count"`
+	Next   string `json:"next,omitempty"`
+	Prev   string `json:"prev,omitempty"`
+}
+
+// ---- API methods ----
+
+// BillsOptions controls the /bill list call.
+type BillsOptions struct {
+	Limit    int
+	Offset   int
+	Congress int    // 0 = all congresses
+	Type     string // hr, s, hjres, sjres, etc.
+}
+
+// Bills lists legislative bills.
+func (c *Client) Bills(ctx context.Context, opts BillsOptions) ([]*Bill, *Pagination, error) {
+	u := c.cfg.BaseURL + "/bill"
+	sep := "?"
+	add := func(k, v string) {
+		u += sep + k + "=" + v
+		sep = "&"
+	}
+	if opts.Congress > 0 && opts.Type != "" {
+		u = fmt.Sprintf("%s/bill/%d/%s", c.cfg.BaseURL, opts.Congress, opts.Type)
+	} else if opts.Congress > 0 {
+		u = fmt.Sprintf("%s/bill/%d", c.cfg.BaseURL, opts.Congress)
+	}
+	if opts.Limit > 0 {
+		add("limit", fmt.Sprintf("%d", opts.Limit))
+	}
+	if opts.Offset > 0 {
+		add("offset", fmt.Sprintf("%d", opts.Offset))
+	}
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var resp struct {
+		Bills      []*Bill    `json:"bills"`
+		Pagination Pagination `json:"pagination"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, nil, fmt.Errorf("decode bills: %w", err)
+	}
+	return resp.Bills, &resp.Pagination, nil
+}
+
+// Bill fetches a single bill by congress/type/number.
+func (c *Client) Bill(ctx context.Context, congress int, billType, number string) (*BillDetail, error) {
+	u := fmt.Sprintf("%s/bill/%d/%s/%s", c.cfg.BaseURL, congress, strings.ToLower(billType), number)
+	body, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+
+	var resp struct {
+		Bill BillDetail `json:"bill"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode bill: %w", err)
+	}
+	return &resp.Bill, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// MembersOptions controls the /member list call.
+type MembersOptions struct {
+	Limit  int
+	Offset int
+	State  string // two-letter state code
+	Party  string // D, R, ID, etc.
+}
+
+// Members lists members of Congress.
+func (c *Client) Members(ctx context.Context, opts MembersOptions) ([]*Member, *Pagination, error) {
+	u := c.cfg.BaseURL + "/member"
+	sep := "?"
+	add := func(k, v string) {
+		u += sep + k + "=" + v
+		sep = "&"
+	}
+	if opts.Limit > 0 {
+		add("limit", fmt.Sprintf("%d", opts.Limit))
+	}
+	if opts.Offset > 0 {
+		add("offset", fmt.Sprintf("%d", opts.Offset))
+	}
+	if opts.State != "" {
+		add("stateCode", opts.State)
+	}
+	if opts.Party != "" {
+		add("partyCode", opts.Party)
+	}
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var resp struct {
+		Members    []*Member  `json:"members"`
+		Pagination Pagination `json:"pagination"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, nil, fmt.Errorf("decode members: %w", err)
+	}
+	return resp.Members, &resp.Pagination, nil
+}
+
+// Member fetches a single member by bioguide ID.
+func (c *Client) Member(ctx context.Context, bioguideID string) (*MemberDetail, error) {
+	u := fmt.Sprintf("%s/member/%s", c.cfg.BaseURL, bioguideID)
+	body, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+
+	var resp struct {
+		Member MemberDetail `json:"member"`
 	}
-	return out, nil
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode member: %w", err)
+	}
+	return &resp.Member, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// CommitteesOptions controls the /committee list call.
+type CommitteesOptions struct {
+	Limit   int
+	Offset  int
+	Chamber string // senate, house, joint
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// Committees lists congressional committees.
+func (c *Client) Committees(ctx context.Context, opts CommitteesOptions) ([]*Committee, *Pagination, error) {
+	u := c.cfg.BaseURL + "/committee"
+	sep := "?"
+	add := func(k, v string) {
+		u += sep + k + "=" + v
+		sep = "&"
 	}
-	return s
+	if opts.Chamber != "" {
+		u = fmt.Sprintf("%s/committee/%s", c.cfg.BaseURL, strings.ToLower(opts.Chamber))
+	}
+	if opts.Limit > 0 {
+		add("limit", fmt.Sprintf("%d", opts.Limit))
+	}
+	if opts.Offset > 0 {
+		add("offset", fmt.Sprintf("%d", opts.Offset))
+	}
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var resp struct {
+		Committees []*Committee `json:"committees"`
+		Pagination Pagination   `json:"pagination"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, nil, fmt.Errorf("decode committees: %w", err)
+	}
+	return resp.Committees, &resp.Pagination, nil
 }
